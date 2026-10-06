@@ -5,14 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 )
 
 const (
-	signalsConsentBasePath = "/v1/consent"
-	signalsConsentByIDPath = signalsConsentBasePath + "/%s"
-	signalsExportsBasePath = "/v1/signals/exports"
-	signalsExportsByIDPath = signalsExportsBasePath + "/%s"
+	signalsConsentBasePath       = "/v1/consent"
+	signalsConsentByIDPath       = signalsConsentBasePath + "/%s"
+	signalsExportsBasePath       = "/v1/signals/exports"
+	signalsExportsByIDPath       = signalsExportsBasePath + "/%s"
+	signalsExportsDownloadPath   = signalsExportsBasePath + "/%s/download"
+	signalsExportsOptionsPath    = signalsExportsBasePath + "/options"
+	signalsExportTriggerBasePath = "/v1/signals/export-trigger"
 )
 
 // SignalsService is an interface for interacting with the DigitalOcean Signals
@@ -22,23 +26,22 @@ const (
 // per-agent collection consent for a team.
 //
 // Export routes live under /v1/signals/exports (signals-api). They manage
-// bulk signal export jobs.
+// async bulk export jobs. Filter catalog is GET /v1/signals/exports/options.
+// Download URLs are minted separately via GET /v1/signals/exports/{id}/download.
+// Weekly scheduled-export opt-in is GET/PUT /v1/signals/export-trigger.
 type SignalsService interface {
-	// ListConsents returns all consent records for the authenticated team.
 	ListConsents(context.Context) ([]SignalsConsent, *Response, error)
-	// GetConsent returns the consent record for a single agent.
 	GetConsent(context.Context, string) (*SignalsConsent, *Response, error)
-	// SetConsent enables or disables signal collection for an agent.
 	SetConsent(context.Context, string, *SignalsConsentSetRequest) (*SignalsConsent, *Response, error)
 
-	// ListExports returns export jobs visible to the authenticated team.
 	ListExports(context.Context, *SignalsExportListOptions) ([]SignalsExport, *Response, error)
-	// CreateExport starts a bulk export job. The create is idempotent: if an
-	// active export already exists for the same parameters, it is returned.
 	CreateExport(context.Context, *SignalsExportCreateRequest) (*SignalsExport, *Response, error)
-	// GetExport returns a single export job by ID. Poll this to wait for
-	// completion; the download URL is set when the status is "completed".
 	GetExport(context.Context, string) (*SignalsExport, *Response, error)
+	GetExportDownload(context.Context, string) (*SignalsExportDownload, *Response, error)
+	GetExportOptions(context.Context) (*SignalsExportOptions, *Response, error)
+
+	GetExportTrigger(context.Context) (*SignalsExportTrigger, *Response, error)
+	UpsertExportTrigger(context.Context, *SignalsExportTriggerUpsertRequest) (*SignalsExportTrigger, *Response, error)
 }
 
 // SignalsServiceOp handles communication with the Signals-related methods of
@@ -49,16 +52,15 @@ type SignalsServiceOp struct {
 
 var _ SignalsService = &SignalsServiceOp{}
 
-// --- Consent types ---
-
 // SignalsConsent represents a Signals collection consent record for one
-// (team, agent) pair.
+// (team, agent) pair. GET of a missing row returns enabled=false with no id.
 type SignalsConsent struct {
-	ID        uint64    `json:"id"`
+	ID        uint64    `json:"id,omitempty"`
 	TeamID    uint64    `json:"team_id"`
 	AgentID   string    `json:"agent_id"`
 	Enabled   bool      `json:"enabled"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Allowed   *bool     `json:"allowed,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
 // SignalsConsentSetRequest is the body for PUT /v1/consent/{agent_id}.
@@ -66,20 +68,30 @@ type SignalsConsentSetRequest struct {
 	Enabled bool `json:"enabled"`
 }
 
-// --- Export types ---
-
-// SignalsExport represents a Signals bulk export job.
+// SignalsExport is an async bulk-export job (ExportJob).
+// Timestamps are Unix epoch seconds (UTC), not RFC3339.
+// Status is one of: queued, running, complete, failed, expired.
 type SignalsExport struct {
-	ID           string    `json:"id"`
-	TeamID       int64     `json:"team_id"`
-	AgentID      string    `json:"agent_id"`
-	Status       string    `json:"status"`
-	SignalTypes  []string  `json:"signal_types"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-	CompletedAt  *string   `json:"completed_at,omitempty"`
-	DownloadURL  *string   `json:"download_url,omitempty"`
-	ErrorMessage *string   `json:"error_message,omitempty"`
+	ExportID     string               `json:"export_id"`
+	AgentID      *string              `json:"agent_id,omitempty"`
+	Status       string               `json:"status"`
+	Filters      SignalsExportFilters `json:"filters"`
+	CreatedAt    int64                `json:"created_at"`
+	CompletedAt  *int64               `json:"completed_at"`
+	ExpiresAt    *int64               `json:"expires_at"`
+	ErrorMessage *string              `json:"error_message"`
+}
+
+// SignalsExportFilters is the create-time cohort snapshot stored on the job.
+// JSON uses signal_type (singular), matching POST /exports.
+type SignalsExportFilters struct {
+	SessionIDs     []string `json:"session_ids,omitempty"`
+	SignalType     []string `json:"signal_type,omitempty"`
+	SignalCategory *string  `json:"signal_category,omitempty"`
+	SignalLayer    *string  `json:"signal_layer,omitempty"`
+	Concerning     *bool    `json:"concerning,omitempty"`
+	StartTime      *int64   `json:"start_time,omitempty"`
+	EndTime        *int64   `json:"end_time,omitempty"`
 }
 
 // SignalsExportListOptions specifies optional filters for ListExports.
@@ -90,14 +102,50 @@ type SignalsExportListOptions struct {
 }
 
 // SignalsExportCreateRequest is the body for POST /v1/signals/exports.
+// Unknown fields are rejected by the API (DisallowUnknownFields).
+// Use signal_type, not signal_types. signal_types is only for export-trigger.
 type SignalsExportCreateRequest struct {
-	AgentID     string   `json:"agent_id"`
-	SignalTypes []string `json:"signal_types,omitempty"`
-	StartTime   *int64   `json:"start_time,omitempty"`
-	EndTime     *int64   `json:"end_time,omitempty"`
+	AgentID        string   `json:"agent_id"`
+	SessionIDs     []string `json:"session_ids,omitempty"`
+	SignalType     []string `json:"signal_type,omitempty"`
+	SignalCategory *string  `json:"signal_category,omitempty"`
+	SignalLayer    *string  `json:"signal_layer,omitempty"`
+	Concerning     *bool    `json:"concerning,omitempty"`
+	StartTime      *int64   `json:"start_time,omitempty"`
+	EndTime        *int64   `json:"end_time,omitempty"`
 }
 
-// --- Internal response wrappers ---
+// SignalsExportDownload is GET /v1/signals/exports/{id}/download.
+type SignalsExportDownload struct {
+	DownloadURL string `json:"download_url"`
+	ExpiresAt   int64  `json:"expires_at"`
+}
+
+// SignalsExportOptions is GET /v1/signals/exports/options.
+type SignalsExportOptions struct {
+	Filters SignalsExportFilterOptions `json:"filters"`
+}
+
+// SignalsExportFilterOptions is the static detector catalog.
+type SignalsExportFilterOptions struct {
+	SignalType []string `json:"signal_type"`
+}
+
+// SignalsExportTrigger is GET/PUT /v1/signals/export-trigger.
+// This is the only Signals export API that uses signal_types (plural).
+type SignalsExportTrigger struct {
+	Enabled     bool     `json:"enabled"`
+	Cadence     string   `json:"cadence"`
+	SignalTypes []string `json:"signal_types"`
+	UpdatedAt   *int64   `json:"updated_at,omitempty"`
+}
+
+// SignalsExportTriggerUpsertRequest is PUT /v1/signals/export-trigger.
+type SignalsExportTriggerUpsertRequest struct {
+	Enabled     bool     `json:"enabled"`
+	Cadence     string   `json:"cadence,omitempty"`
+	SignalTypes []string `json:"signal_types,omitempty"`
+}
 
 type signalsConsentListResponse struct {
 	TeamID   uint64           `json:"team_id"`
@@ -109,16 +157,16 @@ type signalsConsentSetResponse struct {
 }
 
 type signalsExportListResponse struct {
-	Exports  []SignalsExport `json:"exports"`
-	PageInfo *struct {
+	Edges []struct {
+		Cursor string        `json:"cursor"`
+		Node   SignalsExport `json:"node"`
+	} `json:"edges"`
+	PageInfo struct {
 		HasNextPage bool    `json:"has_next_page"`
 		EndCursor   *string `json:"end_cursor,omitempty"`
-	} `json:"page_info,omitempty"`
+	} `json:"page_info"`
 }
 
-// --- Consent implementation ---
-
-// ListConsents returns all consent records for the authenticated team.
 func (s *SignalsServiceOp) ListConsents(ctx context.Context) ([]SignalsConsent, *Response, error) {
 	req, err := s.client.NewRequest(ctx, http.MethodGet, signalsConsentBasePath, nil)
 	if err != nil {
@@ -132,12 +180,11 @@ func (s *SignalsServiceOp) ListConsents(ctx context.Context) ([]SignalsConsent, 
 	return root.Consents, resp, nil
 }
 
-// GetConsent returns the consent record for a single agent.
 func (s *SignalsServiceOp) GetConsent(ctx context.Context, agentID string) (*SignalsConsent, *Response, error) {
 	if agentID == "" {
 		return nil, nil, errors.New("signals: agent id is required")
 	}
-	path := fmt.Sprintf(signalsConsentByIDPath, agentID)
+	path := fmt.Sprintf(signalsConsentByIDPath, url.PathEscape(agentID))
 	req, err := s.client.NewRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, nil, err
@@ -150,7 +197,6 @@ func (s *SignalsServiceOp) GetConsent(ctx context.Context, agentID string) (*Sig
 	return consent, resp, nil
 }
 
-// SetConsent enables or disables signal collection for an agent.
 func (s *SignalsServiceOp) SetConsent(ctx context.Context, agentID string, body *SignalsConsentSetRequest) (*SignalsConsent, *Response, error) {
 	if agentID == "" {
 		return nil, nil, errors.New("signals: agent id is required")
@@ -158,7 +204,7 @@ func (s *SignalsServiceOp) SetConsent(ctx context.Context, agentID string, body 
 	if body == nil {
 		return nil, nil, errors.New("signals: set consent request is required")
 	}
-	path := fmt.Sprintf(signalsConsentByIDPath, agentID)
+	path := fmt.Sprintf(signalsConsentByIDPath, url.PathEscape(agentID))
 	req, err := s.client.NewRequest(ctx, http.MethodPut, path, body)
 	if err != nil {
 		return nil, nil, err
@@ -171,9 +217,6 @@ func (s *SignalsServiceOp) SetConsent(ctx context.Context, agentID string, body 
 	return &root.Consent, resp, nil
 }
 
-// --- Export implementation ---
-
-// ListExports returns export jobs visible to the authenticated team.
 func (s *SignalsServiceOp) ListExports(ctx context.Context, opt *SignalsExportListOptions) ([]SignalsExport, *Response, error) {
 	path, err := addOptions(signalsExportsBasePath, opt)
 	if err != nil {
@@ -188,10 +231,13 @@ func (s *SignalsServiceOp) ListExports(ctx context.Context, opt *SignalsExportLi
 	if err != nil {
 		return nil, resp, err
 	}
-	return root.Exports, resp, nil
+	out := make([]SignalsExport, 0, len(root.Edges))
+	for _, e := range root.Edges {
+		out = append(out, e.Node)
+	}
+	return out, resp, nil
 }
 
-// CreateExport starts a bulk signal export job.
 func (s *SignalsServiceOp) CreateExport(ctx context.Context, body *SignalsExportCreateRequest) (*SignalsExport, *Response, error) {
 	if body == nil {
 		return nil, nil, errors.New("signals: create export request is required")
@@ -211,12 +257,11 @@ func (s *SignalsServiceOp) CreateExport(ctx context.Context, body *SignalsExport
 	return export, resp, nil
 }
 
-// GetExport returns a single export job by ID.
 func (s *SignalsServiceOp) GetExport(ctx context.Context, exportID string) (*SignalsExport, *Response, error) {
 	if exportID == "" {
 		return nil, nil, errors.New("signals: export id is required")
 	}
-	path := fmt.Sprintf(signalsExportsByIDPath, exportID)
+	path := fmt.Sprintf(signalsExportsByIDPath, url.PathEscape(exportID))
 	req, err := s.client.NewRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, nil, err
@@ -227,4 +272,63 @@ func (s *SignalsServiceOp) GetExport(ctx context.Context, exportID string) (*Sig
 		return nil, resp, err
 	}
 	return export, resp, nil
+}
+
+func (s *SignalsServiceOp) GetExportDownload(ctx context.Context, exportID string) (*SignalsExportDownload, *Response, error) {
+	if exportID == "" {
+		return nil, nil, errors.New("signals: export id is required")
+	}
+	path := fmt.Sprintf(signalsExportsDownloadPath, url.PathEscape(exportID))
+	req, err := s.client.NewRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	dl := new(SignalsExportDownload)
+	resp, err := s.client.Do(ctx, req, dl)
+	if err != nil {
+		return nil, resp, err
+	}
+	return dl, resp, nil
+}
+
+func (s *SignalsServiceOp) GetExportOptions(ctx context.Context) (*SignalsExportOptions, *Response, error) {
+	req, err := s.client.NewRequest(ctx, http.MethodGet, signalsExportsOptionsPath, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	opts := new(SignalsExportOptions)
+	resp, err := s.client.Do(ctx, req, opts)
+	if err != nil {
+		return nil, resp, err
+	}
+	return opts, resp, nil
+}
+
+func (s *SignalsServiceOp) GetExportTrigger(ctx context.Context) (*SignalsExportTrigger, *Response, error) {
+	req, err := s.client.NewRequest(ctx, http.MethodGet, signalsExportTriggerBasePath, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	trig := new(SignalsExportTrigger)
+	resp, err := s.client.Do(ctx, req, trig)
+	if err != nil {
+		return nil, resp, err
+	}
+	return trig, resp, nil
+}
+
+func (s *SignalsServiceOp) UpsertExportTrigger(ctx context.Context, body *SignalsExportTriggerUpsertRequest) (*SignalsExportTrigger, *Response, error) {
+	if body == nil {
+		return nil, nil, errors.New("signals: export trigger request is required")
+	}
+	req, err := s.client.NewRequest(ctx, http.MethodPut, signalsExportTriggerBasePath, body)
+	if err != nil {
+		return nil, nil, err
+	}
+	trig := new(SignalsExportTrigger)
+	resp, err := s.client.Do(ctx, req, trig)
+	if err != nil {
+		return nil, resp, err
+	}
+	return trig, resp, nil
 }
